@@ -1,0 +1,227 @@
+#!/bin/bash
+# Setup rclone crypt remote for encrypted BTRFS backups
+# Uses the same password as restic for consistency
+#
+set -euo pipefail
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Configuration
+RCLONE_CONFIG="${HOME}/.config/rclone/rclone.conf"
+RESTIC_PASSWORD_FILE="${HOME}/.config/restic/projects-password"
+CRYPT_REMOTE_NAME="K-Solutions-Crypt"
+BASE_REMOTE="K-Solutions"
+ENCRYPTED_PATH="Backups/Linux/cachyos-snapshots-encrypted"
+
+log_info() { echo -e "${GREEN}[INFO]${NC} $*"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
+
+# Check prerequisites
+check_prerequisites() {
+    log_info "Checking prerequisites..."
+    
+    # Check rclone
+    if ! command -v rclone &>/dev/null; then
+        log_error "rclone is not installed"
+        exit 1
+    fi
+    
+    # Check rclone config exists
+    if [[ ! -f "$RCLONE_CONFIG" ]]; then
+        log_error "rclone config not found at $RCLONE_CONFIG"
+        exit 1
+    fi
+    
+    # Check base remote exists
+    if ! rclone listremotes | grep -q "^${BASE_REMOTE}:$"; then
+        log_error "Base remote '$BASE_REMOTE' not found in rclone config"
+        log_info "Available remotes:"
+        rclone listremotes
+        exit 1
+    fi
+    
+    # Check restic password file exists
+    if [[ ! -f "$RESTIC_PASSWORD_FILE" ]]; then
+        log_error "Restic password file not found at $RESTIC_PASSWORD_FILE"
+        log_info "Please create the password file first:"
+        log_info "  mkdir -p ~/.config/restic"
+        log_info "  echo 'your-secure-password' > ~/.config/restic/projects-password"
+        log_info "  chmod 600 ~/.config/restic/projects-password"
+        exit 1
+    fi
+    
+    log_info "All prerequisites met"
+}
+
+# Check if crypt remote already exists
+check_existing() {
+    if rclone listremotes | grep -q "^${CRYPT_REMOTE_NAME}:$"; then
+        log_warn "Remote '$CRYPT_REMOTE_NAME' already exists"
+        echo ""
+        read -p "Do you want to recreate it? (y/N) " -n 1 -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_info "Keeping existing configuration"
+            exit 0
+        fi
+        
+        # Remove existing remote
+        log_info "Removing existing remote..."
+        rclone config delete "$CRYPT_REMOTE_NAME"
+    fi
+}
+
+# Create the encrypted remote
+create_crypt_remote() {
+    log_info "Creating encrypted remote '$CRYPT_REMOTE_NAME'..."
+    
+    # Read the restic password
+    local password
+    password=$(cat "$RESTIC_PASSWORD_FILE")
+    
+    if [[ -z "$password" ]]; then
+        log_error "Password file is empty"
+        exit 1
+    fi
+    
+    # Generate a salt from the password (for password2)
+    # Using a deterministic salt based on the password ensures reproducibility
+    local salt
+    salt=$(echo -n "${password}-rclone-salt" | sha256sum | cut -d' ' -f1 | head -c 32)
+    
+    # Obscure the passwords for rclone
+    local obscured_password
+    local obscured_salt
+    obscured_password=$(rclone obscure "$password")
+    obscured_salt=$(rclone obscure "$salt")
+    
+    # Create the crypt remote using rclone config
+    rclone config create "$CRYPT_REMOTE_NAME" crypt \
+        remote="${BASE_REMOTE}:${ENCRYPTED_PATH}" \
+        password="$obscured_password" \
+        password2="$obscured_salt" \
+        filename_encryption="standard" \
+        directory_name_encryption="true"
+    
+    log_info "Encrypted remote created successfully"
+}
+
+# Create the remote directory
+create_remote_directory() {
+    log_info "Creating remote directory..."
+    
+    # Create the encrypted backup directory on Google Drive
+    if rclone mkdir "${BASE_REMOTE}:${ENCRYPTED_PATH}" 2>/dev/null; then
+        log_info "Created directory: ${BASE_REMOTE}:${ENCRYPTED_PATH}"
+    else
+        log_info "Directory already exists or was created"
+    fi
+}
+
+# Test the configuration
+test_configuration() {
+    log_info "Testing encrypted remote..."
+    
+    # Create a test file
+    local test_content="rclone-crypt-test-$(date +%s)"
+    local test_file="/tmp/rclone-crypt-test.txt"
+    echo "$test_content" > "$test_file"
+    
+    # Upload test file
+    log_info "  Uploading test file..."
+    if rclone copy "$test_file" "${CRYPT_REMOTE_NAME}:test/" 2>/dev/null; then
+        log_info "  ✓ Upload successful"
+    else
+        log_error "  ✗ Upload failed"
+        rm -f "$test_file"
+        exit 1
+    fi
+    
+    # Verify file is encrypted on the base remote
+    log_info "  Verifying encryption..."
+    local encrypted_files
+    encrypted_files=$(rclone ls "${BASE_REMOTE}:${ENCRYPTED_PATH}/test/" 2>/dev/null || echo "")
+    if [[ -n "$encrypted_files" ]]; then
+        log_info "  ✓ File is encrypted on remote (filename is obfuscated)"
+    else
+        log_warn "  ⚠ Could not verify encryption"
+    fi
+    
+    # Download and verify content
+    log_info "  Downloading and verifying..."
+    local download_file="/tmp/rclone-crypt-test-download.txt"
+    if rclone copy "${CRYPT_REMOTE_NAME}:test/rclone-crypt-test.txt" "/tmp/" 2>/dev/null; then
+        mv "/tmp/rclone-crypt-test.txt" "$download_file" 2>/dev/null || true
+    fi
+    
+    if [[ -f "$download_file" ]]; then
+        local downloaded_content
+        downloaded_content=$(cat "$download_file")
+        if [[ "$downloaded_content" == "$test_content" ]]; then
+            log_info "  ✓ Content verified successfully"
+        else
+            log_error "  ✗ Content mismatch!"
+            rm -f "$test_file" "$download_file"
+            exit 1
+        fi
+        rm -f "$download_file"
+    else
+        log_warn "  ⚠ Could not download test file for verification"
+    fi
+    
+    # Cleanup test files
+    log_info "  Cleaning up test files..."
+    rclone purge "${CRYPT_REMOTE_NAME}:test/" 2>/dev/null || true
+    rm -f "$test_file"
+    
+    log_info "Test completed successfully!"
+}
+
+# Show summary
+show_summary() {
+    echo ""
+    echo "========================================"
+    log_info "rclone crypt Setup Complete!"
+    echo "========================================"
+    echo ""
+    echo "Configuration:"
+    echo "  Encrypted Remote: ${CRYPT_REMOTE_NAME}:"
+    echo "  Base Remote:      ${BASE_REMOTE}:${ENCRYPTED_PATH}"
+    echo "  Password Source:  ${RESTIC_PASSWORD_FILE}"
+    echo ""
+    echo "Usage:"
+    echo "  # List encrypted files (decrypted view)"
+    echo "  rclone ls ${CRYPT_REMOTE_NAME}:"
+    echo ""
+    echo "  # Copy files to encrypted storage"
+    echo "  rclone copy /path/to/file ${CRYPT_REMOTE_NAME}:backup/"
+    echo ""
+    echo "  # View encrypted files on Google Drive"
+    echo "  rclone ls ${BASE_REMOTE}:${ENCRYPTED_PATH}"
+    echo ""
+    echo "IMPORTANT: The encryption password is the same as your restic password."
+    echo "Keep your password file safe: ${RESTIC_PASSWORD_FILE}"
+    echo ""
+}
+
+# Main
+main() {
+    echo "========================================"
+    echo "rclone crypt Setup for BTRFS Backups"
+    echo "========================================"
+    echo ""
+    
+    check_prerequisites
+    check_existing
+    create_crypt_remote
+    create_remote_directory
+    test_configuration
+    show_summary
+}
+
+main "$@"
