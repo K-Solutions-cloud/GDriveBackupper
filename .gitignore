@@ -1,0 +1,23 @@
+# State directory (contains logs and runtime state)
+state/
+
+# Log files
+*.log
+
+# Restic password file (sensitive)
+config/restic-password
+
+# Backup files
+*.bak
+*.backup
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
