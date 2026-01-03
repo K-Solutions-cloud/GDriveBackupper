@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily Project Backup Timer
+
+[Timer]
+# Run daily at 4:00 AM (1 hour after BTRFS backup)
+OnCalendar=*-*-* 04:00:00
+# If system was off at 4 AM, run backup when it comes online
+Persistent=true
+# Add random delay up to 5 minutes to avoid exact timing
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

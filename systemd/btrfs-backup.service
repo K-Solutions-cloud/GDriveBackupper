@@ -1,0 +1,18 @@
+[Unit]
+Description=BTRFS Snapshot Backup to Google Drive
+After=network-online.target rclone-gdrive.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Run as root via sudo (needed for btrfs send)
+ExecStart=/usr/bin/sudo /home/aaron/.local/bin/btrfs-cloud-backup
+# Nice priority to not interfere with normal work
+Nice=19
+IOSchedulingClass=idle
+# Environment
+Environment=HOME=/home/aaron
+Environment=USER=aaron
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=Restic Project Backup to Google Drive
+After=network-online.target rclone-gdrive.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/aaron/.local/bin/project-backup backup
+# Nice priority to not interfere with normal work
+Nice=19
+IOSchedulingClass=idle
+# Environment
+Environment=HOME=/home/aaron
+Environment=USER=aaron
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
