@@ -1,0 +1,313 @@
+#!/bin/bash
+# BTRFS Cloud Backup Script
+# Uploads daily snapshots to Google Drive
+# Supports both encrypted (rclone crypt) and unencrypted backups
+#
+set -euo pipefail
+
+# Configuration
+SNAPPER_CONFIG="root"
+# Use aaron's home directory explicitly (script runs as root)
+REAL_USER="aaron"
+REAL_HOME="/home/aaron"
+LOCAL_STATE_DIR="$REAL_HOME/.local/state/btrfs-backup"
+LOG_FILE="$LOCAL_STATE_DIR/backup.log"
+RCLONE_CONFIG="$REAL_HOME/.config/rclone/rclone.conf"
+MAX_LOG_SIZE=10485760  # 10MB
+
+# Remote configuration - can be overridden with --encrypted flag
+RCLONE_REMOTE="K-Solutions"
+REMOTE_PATH="Backups/Linux/cachyos-snapshots"
+RCLONE_REMOTE_ENCRYPTED="K-Solutions-Crypt"
+REMOTE_PATH_ENCRYPTED=""  # Root of crypt remote
+
+# Default to encrypted backups
+USE_ENCRYPTION=true
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Create state directory
+mkdir -p "$LOCAL_STATE_DIR"
+
+# Rotate log if too large
+if [[ -f "$LOG_FILE" ]] && [[ $(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE") -gt $MAX_LOG_SIZE ]]; then
+    mv "$LOG_FILE" "$LOG_FILE.old"
+fi
+
+log() {
+    local level=$1
+    shift
+    local message="$*"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+}
+
+log_info() { log "INFO" "$*"; }
+log_warn() { log "WARN" "${YELLOW}$*${NC}"; }
+log_error() { log "ERROR" "${RED}$*${NC}"; }
+log_success() { log "OK" "${GREEN}$*${NC}"; }
+
+show_usage() {
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --encrypted     Use encrypted remote (K-Solutions-Crypt) [default]"
+    echo "  --unencrypted   Use unencrypted remote (K-Solutions)"
+    echo "  --list          List existing backups"
+    echo "  --help          Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  sudo $0                    # Encrypted backup (default)"
+    echo "  sudo $0 --unencrypted      # Unencrypted backup"
+    echo "  sudo $0 --list             # List backups"
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --encrypted)
+                USE_ENCRYPTION=true
+                shift
+                ;;
+            --unencrypted)
+                USE_ENCRYPTION=false
+                shift
+                ;;
+            --list)
+                list_backups
+                exit 0
+                ;;
+            --help|-h)
+                show_usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                show_usage
+                exit 1
+                ;;
+        esac
+    done
+    
+    if [[ "$USE_ENCRYPTION" == "true" ]]; then
+        ACTIVE_REMOTE="$RCLONE_REMOTE_ENCRYPTED"
+        ACTIVE_PATH="$REMOTE_PATH_ENCRYPTED"
+        log_info "Using ENCRYPTED remote: ${ACTIVE_REMOTE}:"
+    else
+        ACTIVE_REMOTE="$RCLONE_REMOTE"
+        ACTIVE_PATH="$REMOTE_PATH"
+        log_info "Using UNENCRYPTED remote: ${ACTIVE_REMOTE}:${ACTIVE_PATH}"
+    fi
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root (for btrfs send)"
+        log_info "Try: sudo $0"
+        exit 1
+    fi
+}
+
+check_encrypted_remote() {
+    if [[ "$USE_ENCRYPTION" == "true" ]]; then
+        if ! rclone --config "$RCLONE_CONFIG" listremotes 2>/dev/null | grep -q "^${RCLONE_REMOTE_ENCRYPTED}:$"; then
+            log_error "Encrypted remote '$RCLONE_REMOTE_ENCRYPTED' not found!"
+            log_info "Please run the setup script first:"
+            log_info "  $REAL_HOME/.local/bin/setup-rclone-crypt"
+            log_info ""
+            log_info "Or use --unencrypted for unencrypted backups"
+            exit 1
+        fi
+    fi
+}
+
+get_latest_snapshot() {
+    local latest=$(snapper -c "$SNAPPER_CONFIG" list --columns number 2>/dev/null | \
+        grep -E '^[0-9]+$' | \
+        grep -v '^0$' | \
+        tail -1 | \
+        tr -d ' ')
+    echo "$latest"
+}
+
+get_snapshot_path() {
+    local num=$1
+    echo "/.snapshots/${num}/snapshot"
+}
+
+get_last_backup() {
+    local state_file="$LOCAL_STATE_DIR/last_backup_$SNAPPER_CONFIG"
+    if [[ -f "$state_file" ]]; then
+        cat "$state_file"
+    else
+        echo ""
+    fi
+}
+
+save_last_backup() {
+    local num=$1
+    local state_file="$LOCAL_STATE_DIR/last_backup_$SNAPPER_CONFIG"
+    echo "$num" > "$state_file"
+}
+
+do_backup() {
+    local snapshot_num=$1
+    local parent_num=$2
+    local snapshot_path=$(get_snapshot_path "$snapshot_num")
+    local date_str=$(date '+%Y-%m-%d_%H%M%S')
+    local backup_name="snapshot_${snapshot_num}_${date_str}"
+    
+    if [[ ! -d "$snapshot_path" ]]; then
+        log_error "Snapshot path does not exist: $snapshot_path"
+        exit 1
+    fi
+    
+    log_info "Starting backup of snapshot #$snapshot_num"
+    log_info "Snapshot path: $snapshot_path"
+    
+    local send_opts=""
+    local backup_type="full"
+    
+    if [[ -n "$parent_num" ]]; then
+        local parent_path=$(get_snapshot_path "$parent_num")
+        if [[ -d "$parent_path" ]]; then
+            send_opts="-p $parent_path"
+            backup_type="incremental"
+            backup_name="${backup_name}_from_${parent_num}"
+            log_info "Incremental backup from snapshot #$parent_num"
+        else
+            log_warn "Parent snapshot #$parent_num not found, doing full backup"
+        fi
+    else
+        log_info "Full backup (no parent snapshot)"
+    fi
+    
+    local remote_file
+    if [[ -n "$ACTIVE_PATH" ]]; then
+        remote_file="${ACTIVE_REMOTE}:${ACTIVE_PATH}/${backup_name}.btrfs.zst"
+    else
+        remote_file="${ACTIVE_REMOTE}:${backup_name}.btrfs.zst"
+    fi
+    local temp_file="/tmp/btrfs-backup-${backup_name}.zst"
+    
+    log_info "Backup type: $backup_type"
+    log_info "Destination: $remote_file"
+    
+    trap "rm -f '$temp_file'" EXIT
+    
+    log_info ""
+    log_info "Step 1/2: Creating compressed snapshot..."
+    
+    if btrfs send $send_opts "$snapshot_path" 2>>"$LOG_FILE" | \
+       pv -pterab -N "Compressing" | \
+       zstd -T0 -3 -q -o "$temp_file"; then
+        local file_size=$(stat -c%s "$temp_file")
+        local file_size_mb=$((file_size / 1024 / 1024))
+        log_success "Compressed snapshot created: ${file_size_mb}MB"
+    else
+        log_error "Failed to create compressed snapshot!"
+        exit 1
+    fi
+    
+    log_info ""
+    log_info "Step 2/2: Uploading to Google Drive..."
+    
+    local file_size=$(stat -c%s "$temp_file")
+    local remote_filename="${backup_name}.btrfs.zst"
+    
+    local upload_dest
+    if [[ -n "$ACTIVE_PATH" ]]; then
+        upload_dest="${ACTIVE_REMOTE}:${ACTIVE_PATH}/${remote_filename}"
+    else
+        upload_dest="${ACTIVE_REMOTE}:${remote_filename}"
+    fi
+    
+    if pv -pterab -s "$file_size" -N "Uploading" "$temp_file" | \
+        rclone --config "$RCLONE_CONFIG" rcat "$upload_dest" 2>>"$LOG_FILE"; then
+        echo ""
+        log_success "Upload completed successfully!"
+        
+        local remote_size=$(rclone --config "$RCLONE_CONFIG" size "$upload_dest" --json 2>/dev/null | grep -o '"bytes":[0-9]*' | cut -d: -f2)
+        if [[ -n "$remote_size" ]] && [[ "$remote_size" -gt 0 ]]; then
+            local size_mb=$((remote_size / 1024 / 1024))
+            log_success "Verified upload: ${size_mb}MB"
+            save_last_backup "$snapshot_num"
+        else
+            log_warn "Could not verify upload size, but upload seemed successful"
+            save_last_backup "$snapshot_num"
+        fi
+    else
+        echo ""
+        log_error "Upload failed!"
+        exit 1
+    fi
+    
+    rm -f "$temp_file"
+    trap - EXIT
+}
+
+list_backups() {
+    log_info "Existing backups:"
+    
+    echo ""
+    echo "=== Encrypted backups (${RCLONE_REMOTE_ENCRYPTED}:) ==="
+    if rclone --config "$RCLONE_CONFIG" listremotes 2>/dev/null | grep -q "^${RCLONE_REMOTE_ENCRYPTED}:$"; then
+        rclone --config "$RCLONE_CONFIG" ls "${RCLONE_REMOTE_ENCRYPTED}:" 2>/dev/null | while read size name; do
+            local size_mb=$((size / 1024 / 1024))
+            echo "  - $name (${size_mb}MB)"
+        done || echo "  (no backups found)"
+    else
+        echo "  (encrypted remote not configured)"
+    fi
+    
+    echo ""
+    echo "=== Unencrypted backups (${RCLONE_REMOTE}:${REMOTE_PATH}/) ==="
+    rclone --config "$RCLONE_CONFIG" ls "${RCLONE_REMOTE}:${REMOTE_PATH}/" 2>/dev/null | while read size name; do
+        local size_mb=$((size / 1024 / 1024))
+        echo "  - $name (${size_mb}MB)"
+    done || echo "  (no backups found)"
+}
+
+main() {
+    log_info "=========================================="
+    log_info "BTRFS Cloud Backup Starting"
+    log_info "=========================================="
+    
+    parse_args "$@"
+    check_root
+    check_encrypted_remote
+    
+    local latest=$(get_latest_snapshot)
+    if [[ -z "$latest" ]] || [[ "$latest" == "0" ]]; then
+        log_error "No snapshots found!"
+        exit 1
+    fi
+    log_info "Latest snapshot: #$latest"
+    
+    local last_backup=$(get_last_backup)
+    if [[ -n "$last_backup" ]]; then
+        log_info "Last backed up snapshot: #$last_backup"
+        
+        if [[ "$latest" == "$last_backup" ]]; then
+            log_info "Snapshot #$latest already backed up. Nothing to do."
+            exit 0
+        fi
+    else
+        log_info "No previous backup found, will do full backup"
+    fi
+    
+    do_backup "$latest" "$last_backup"
+    
+    echo ""
+    list_backups
+    
+    log_info "=========================================="
+    log_info "Backup Complete!"
+    log_info "=========================================="
+}
+
+main "$@"
